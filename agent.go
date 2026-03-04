@@ -72,7 +72,7 @@ func (a *Agent) Run(ctx context.Context, question string) (string, error) {
 	})
 
 	// 第二次调用 LLM，获取最终回答
-	finalResult, err := a.llmClient.Chat(ctx, messages, toToolDefinitions(tools))
+	finalResult, err := a.llmClient.Chat(ctx, messages, nil)
 	if err != nil {
 		return "", fmt.Errorf("second chat call: %w", err)
 	}
