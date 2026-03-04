@@ -41,6 +41,7 @@ func runAgent() {
 	llmConfig := DefaultLLMConfig()
 	llmClient := NewLLMClient(llmConfig)
 	mcpClient := NewMCPClient("http://localhost:8081")
+	defer mcpClient.Close()
 
 	// 创建 Agent
 	agent := NewAgent(llmClient, mcpClient)

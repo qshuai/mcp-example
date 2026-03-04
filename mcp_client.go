@@ -1,14 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // MCP 工具定义
@@ -20,58 +19,47 @@ type MCPTool struct {
 
 // MCPClient MCP 客户端配置
 type MCPClient struct {
-	baseURL    string
+	endpoint   string
 	httpClient *http.Client
+	client     *mcp.Client
+	session    *mcp.ClientSession
 }
 
 // NewMCPClient 创建 MCP 客户端
-func NewMCPClient(baseURL string) *MCPClient {
-	if baseURL == "" {
-		baseURL = "http://localhost:8081"
+func NewMCPClient(endpoint string) *MCPClient {
+	if endpoint == "" {
+		endpoint = "http://localhost:8081"
 	}
+
 	return &MCPClient{
-		baseURL: baseURL,
+		endpoint: endpoint,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		client: mcp.NewClient(
+			&mcp.Implementation{Name: "agent-client", Version: "v0.1.0"},
+			nil,
+		),
 	}
 }
 
 // ListTools 获取 MCP 工具列表
 func (c *MCPClient) ListTools(ctx context.Context) ([]MCPTool, error) {
-	req := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      1,
-		Method:  "tools/list",
+	if err := c.ensureSession(ctx); err != nil {
+		return nil, err
 	}
 
-	resp, err := c.sendRequest(ctx, req)
+	resp, err := c.session.ListTools(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// 解析 tools/list 响应
-	result, ok := resp.Result.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid result format")
-	}
-
-	toolsRaw, ok := result["tools"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid tools format")
-	}
-
-	tools := make([]MCPTool, 0, len(toolsRaw))
-	for _, tool := range toolsRaw {
-		toolMap, ok := tool.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
+	tools := make([]MCPTool, 0, len(resp.Tools))
+	for _, tool := range resp.Tools {
 		mcpTool := MCPTool{
-			Name:        getString(toolMap, "name"),
-			Description: getString(toolMap, "description"),
-			InputSchema: getMap(toolMap, "input_schema"),
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: toSchemaMap(tool.InputSchema),
 		}
 		tools = append(tools, mcpTool)
 	}
@@ -81,24 +69,23 @@ func (c *MCPClient) ListTools(ctx context.Context) ([]MCPTool, error) {
 
 // CallTool 调用 MCP 工具
 func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]interface{}) (string, error) {
-	req := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      2,
-		Method:  "tools/call",
-		Params: mustJSON(map[string]interface{}{
-			"name":      name,
-			"arguments": args,
-		}),
-	}
-
-	log.Printf("req: %+v", req)
-	resp, err := c.sendRequest(ctx, req)
-	if err != nil {
+	if err := c.ensureSession(ctx); err != nil {
 		return "", err
 	}
 
-	// 将结果转换为 JSON 字符串返回
-	resultJSON, err := json.Marshal(resp.Result)
+	resp, err := c.session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      name,
+		Arguments: args,
+	})
+	if err != nil {
+		return "", fmt.Errorf("call tool: %w", err)
+	}
+
+	if resp.IsError {
+		return "", fmt.Errorf("tool returned error: %s", firstText(resp.Content))
+	}
+
+	resultJSON, err := marshalToolResult(resp)
 	if err != nil {
 		return "", fmt.Errorf("marshal result: %w", err)
 	}
@@ -106,62 +93,72 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]i
 	return string(resultJSON), nil
 }
 
-// sendRequest 发送 JSON-RPC 请求
-func (c *MCPClient) sendRequest(ctx context.Context, req JSONRPCRequest) (*JSONRPCResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+// Close 关闭 MCP 会话
+func (c *MCPClient) Close() error {
+	if c.session == nil {
+		return nil
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/rpc", bytes.NewBuffer(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	var jsonResp JSONRPCResponse
-	if err := json.Unmarshal(data, &jsonResp); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
-	}
-
-	if jsonResp.Error != nil {
-		return nil, fmt.Errorf("RPC error: %v", jsonResp.Error)
-	}
-
-	return &jsonResp, nil
+	err := c.session.Close()
+	c.session = nil
+	return err
 }
 
-// 辅助函数
+func (c *MCPClient) ensureSession(ctx context.Context) error {
+	if c.session != nil {
+		return nil
+	}
 
-func mustJSON(v interface{}) string {
+	transport := &mcp.SSEClientTransport{
+		Endpoint:   c.endpoint,
+		HTTPClient: c.httpClient,
+	}
+
+	session, err := c.client.Connect(ctx, transport, nil)
+	if err != nil {
+		return fmt.Errorf("connect MCP server: %w", err)
+	}
+	c.session = session
+	return nil
+}
+
+func toSchemaMap(v any) map[string]interface{} {
+	if v == nil {
+		return nil
+	}
+
+	if schema, ok := v.(map[string]interface{}); ok {
+		return schema
+	}
+
 	data, err := json.Marshal(v)
 	if err != nil {
-		panic(err)
+		return nil
 	}
-	return string(data)
+
+	var schema map[string]interface{}
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return nil
+	}
+	return schema
 }
 
-func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
+func marshalToolResult(result *mcp.CallToolResult) ([]byte, error) {
+	if result.StructuredContent != nil {
+		return json.Marshal(result.StructuredContent)
 	}
-	return ""
+	if len(result.Content) == 1 {
+		if text, ok := result.Content[0].(*mcp.TextContent); ok {
+			return json.Marshal(map[string]string{"text": text.Text})
+		}
+	}
+	return json.Marshal(result.Content)
 }
 
-func getMap(m map[string]interface{}, key string) map[string]interface{} {
-	if v, ok := m[key].(map[string]interface{}); ok {
-		return v
+func firstText(content []mcp.Content) string {
+	for _, c := range content {
+		if text, ok := c.(*mcp.TextContent); ok {
+			return text.Text
+		}
 	}
-	return nil
+	return "unknown tool error"
 }
